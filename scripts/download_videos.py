@@ -276,6 +276,7 @@ def main():
 
         with ThreadPoolExecutor(max_workers=jobs) as executor:
             pending = []
+            max_pending = max(1, jobs * 2)
 
             def collect_completed():
                 nonlocal success_count, fail_count, skip_count
@@ -302,6 +303,10 @@ def main():
                     progress.set_postfix_str(status_text(), refresh=False)
 
             for name in to_download:
+                while len(pending) >= max_pending:
+                    collect_completed()
+                    if len(pending) >= max_pending:
+                        time.sleep(0.2)
                 pending.append(executor.submit(download_one, name))
                 wait_for_dispatch(collect_completed)
                 collect_completed()
