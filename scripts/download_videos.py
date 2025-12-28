@@ -6,12 +6,37 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError, HfHubHTTPError
 from tqdm import tqdm
 
+DISPATCH_INTERVAL_SECONDS = 2.0
+TQDM_FORMAT = "{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}"
+
+
+@contextmanager
+def hf_quiet_upload():
+    previous_env = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    try:
+        from huggingface_hub.utils import logging as hf_logging
+    except Exception:
+        hf_logging = None
+    if hf_logging is not None and hasattr(hf_logging, "disable_progress_bars"):
+        hf_logging.disable_progress_bars()
+    try:
+        yield
+    finally:
+        if hf_logging is not None and hasattr(hf_logging, "enable_progress_bars"):
+            hf_logging.enable_progress_bars()
+        if previous_env is None:
+            os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+        else:
+            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = previous_env
 
 def load_remote_index(repo_id, repo_type, index_path):
     try:
@@ -54,12 +79,13 @@ def upload_tar_and_index(api, repo_id, repo_type, index_dir, tar_path, file_name
     index_path = os.path.join(index_dir, part_name.replace(".tar", ".json"))
     index_data = load_remote_index(repo_id, repo_type, index_path)
 
-    api.upload_file(
-        path_or_fileobj=tar_path,
-        path_in_repo=f"videos/{part_name}",
-        repo_id=repo_id,
-        repo_type=repo_type,
-    )
+    with hf_quiet_upload():
+        api.upload_file(
+            path_or_fileobj=tar_path,
+            path_in_repo=f"videos/{part_name}",
+            repo_id=repo_id,
+            repo_type=repo_type,
+        )
     if not index_data:
         index_data = []
     existing = set(index_data)
@@ -71,13 +97,15 @@ def upload_tar_and_index(api, repo_id, repo_type, index_dir, tar_path, file_name
     with tempfile.NamedTemporaryFile("w", delete=False) as handle:
         json.dump(index_data, handle)
         temp_index = handle.name
-    api.upload_file(
-        path_or_fileobj=temp_index,
-        path_in_repo=index_path,
-        repo_id=repo_id,
-        repo_type=repo_type,
-    )
+    with hf_quiet_upload():
+        api.upload_file(
+            path_or_fileobj=temp_index,
+            path_in_repo=index_path,
+            repo_id=repo_id,
+            repo_type=repo_type,
+        )
     os.remove(temp_index)
+    print(f"Upload complete: videos/{part_name} -> {index_path}")
 
 
 def build_tar(tar_path, file_paths):
@@ -118,7 +146,13 @@ def main():
     tar_numbers, index_files = split_repo_files(repo_files)
     uploaded_files = set()
     if index_files:
-        for index_path in tqdm(index_files, ncols=120, desc="Loading indexes"):
+        for index_path in tqdm(
+            index_files,
+            ncols=120,
+            desc="Loading indexes",
+            mininterval=10,
+            bar_format=TQDM_FORMAT,
+        ):
             index_data = load_remote_index(args.hf_repo, args.repo_type, index_path)
             uploaded_files.update(index_data)
 
@@ -160,6 +194,8 @@ def main():
         batch_paths.append(path)
         batch_names.append(os.path.basename(path))
         batch_size += size
+
+    def maybe_flush():
         if batch_size >= threshold_bytes:
             flush_batch()
 
@@ -170,8 +206,21 @@ def main():
             return video_name, "skipped", file_path
         try:
             subprocess.run(
-                ["yt-dlp", "-c", "-o", file_path, "-f", "134", url],
+                [
+                    "yt-dlp",
+                    "-c",
+                    "--no-progress",
+                    "--no-warnings",
+                    "--quiet",
+                    "-o",
+                    file_path,
+                    "-f",
+                    "134",
+                    url,
+                ],
                 check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
             return video_name, "downloaded", file_path
         except subprocess.CalledProcessError as exc:
@@ -180,43 +229,61 @@ def main():
     success_count = 0
     fail_count = 0
     skip_count = 0
+    next_dispatch_time = time.monotonic() + DISPATCH_INTERVAL_SECONDS
+
+    def status_text():
+        pending_gb = batch_size / (1024 * 1024 * 1024)
+        return f"success={success_count} fail={fail_count} skip={skip_count} pending={pending_gb:.2f}"
+
+    def wait_for_dispatch(collect_fn=None):
+        nonlocal next_dispatch_time
+        while True:
+            now = time.monotonic()
+            if now >= next_dispatch_time:
+                break
+            if collect_fn is not None:
+                collect_fn()
+            time.sleep(0.2)
+        next_dispatch_time = max(
+            next_dispatch_time + DISPATCH_INTERVAL_SECONDS,
+            time.monotonic() + DISPATCH_INTERVAL_SECONDS,
+        )
 
     to_download = []
-    with tqdm(total=len(video_names), ncols=120, desc="Downloading videos") as progress:
+    with tqdm(
+        total=len(video_names),
+        ncols=120,
+        desc="Downloading videos",
+        mininterval=10,
+        bar_format=TQDM_FORMAT,
+    ) as progress:
         for name in video_names:
             filename = f"{name}.mp4"
             file_path = os.path.join(args.video_path, filename)
             if filename in uploaded_files:
                 skip_count += 1
                 progress.update(1)
-                progress.set_postfix(success=success_count, failed=fail_count, skipped=skip_count)
+                progress.set_postfix_str(status_text(), refresh=False)
                 continue
             if os.path.exists(file_path):
                 skip_count += 1
                 add_to_batch(file_path)
+                maybe_flush()
                 progress.update(1)
-                progress.set_postfix(success=success_count, failed=fail_count, skipped=skip_count)
+                progress.set_postfix_str(status_text(), refresh=False)
                 continue
             to_download.append(name)
 
-        if jobs == 1:
-            for name in to_download:
-                _, status, result = download_one(name)
-                if status == "downloaded":
-                    success_count += 1
-                    add_to_batch(result)
-                elif status == "failed":
-                    fail_count += 1
-                else:
-                    skip_count += 1
-                    if isinstance(result, str):
-                        add_to_batch(result)
-                progress.update(1)
-                progress.set_postfix(success=success_count, failed=fail_count, skipped=skip_count)
-        else:
-            with ThreadPoolExecutor(max_workers=jobs) as executor:
-                futures = {executor.submit(download_one, name): name for name in to_download}
-                for future in as_completed(futures):
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            pending = []
+
+            def collect_completed():
+                nonlocal success_count, fail_count, skip_count
+                completed = []
+                for future in pending:
+                    if not future.done():
+                        continue
+                    completed.append(future)
                     _, status, result = future.result()
                     if status == "downloaded":
                         success_count += 1
@@ -228,7 +295,21 @@ def main():
                         if isinstance(result, str):
                             add_to_batch(result)
                     progress.update(1)
-                    progress.set_postfix(success=success_count, failed=fail_count, skipped=skip_count)
+                for future in completed:
+                    pending.remove(future)
+                if completed:
+                    maybe_flush()
+                    progress.set_postfix_str(status_text(), refresh=False)
+
+            for name in to_download:
+                pending.append(executor.submit(download_one, name))
+                wait_for_dispatch(collect_completed)
+                collect_completed()
+
+            while pending:
+                collect_completed()
+                if pending:
+                    time.sleep(0.5)
 
     if batch_paths:
         flush_batch()
