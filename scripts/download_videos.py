@@ -11,9 +11,8 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 import random
 
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import (
-    EntryNotFoundError,
     HfHubHTTPError,
     are_progress_bars_disabled,
     disable_progress_bars,
@@ -38,21 +37,8 @@ def hf_quiet():
             enable_progress_bars()
 
 
-def load_remote_index(repo_id, repo_type, index_path, revision):
-    try:
-        cached = hf_hub_download(
-            repo_id,
-            index_path,
-            repo_type=repo_type,
-            revision=revision,
-        )
-    except EntryNotFoundError:
-        return set()
-    except HfHubHTTPError as exc:
-        if exc.response is not None and exc.response.status_code == 404:
-            return set()
-        raise
-    with open(cached, "r") as handle:
+def load_index_file(path):
+    with open(path, "r") as handle:
         data = json.load(handle)
     if isinstance(data, list):
         return set(data)
@@ -128,6 +114,7 @@ def main():
     batch_names = set()
     batch_size = 0
     post_skip_count = 0
+    last_indexing_delay = 0.0
     last_index_refresh = 0.0
     last_index_sha = None
     last_repo_files = []
@@ -168,7 +155,7 @@ def main():
         return removed
 
     def refresh_indexes(force=False):
-        nonlocal last_remote_files, last_index_refresh, last_index_sha, last_repo_files
+        nonlocal last_remote_files, last_index_refresh, last_index_sha, last_repo_files, last_indexing_delay
         now = time.monotonic()
         if not force and now - last_index_refresh < INDEX_REFRESH_SECONDS:
             return False
@@ -181,25 +168,23 @@ def main():
         _, _, index_files = split_repo_files(curr_repo_files)
 
         curr_remote_files = set()
-        with hf_quiet():
-            for index_path in tqdm(
-                index_files,
-                ncols=120,
-                desc="Loading indexes",
-                mininterval=10,
-                bar_format=TQDM_FORMAT,
-            ):
-                index_data = load_remote_index(
-                    args.hf_repo,
-                    args.repo_type,
-                    index_path,
-                    curr_index_sha,
+        if index_files:
+            with hf_quiet():
+                snapshot_path = snapshot_download(
+                    repo_id=args.hf_repo,
+                    repo_type=args.repo_type,
+                    revision=curr_index_sha,
+                    allow_patterns=index_files,
                 )
-                curr_remote_files.update(index_data)
+                for index_path in index_files:
+                    local_path = os.path.join(snapshot_path, index_path)
+                    index_data = load_index_file(local_path)
+                    curr_remote_files.update(index_data)
 
         changed = curr_remote_files != last_remote_files
         removed = remove_entries(curr_remote_files, count_post_skip=True)
 
+        last_indexing_delay = time.monotonic() - now
         last_index_refresh = now
         last_index_sha = curr_index_sha
         last_repo_files = curr_repo_files
@@ -317,7 +302,8 @@ def main():
             f"fail={fail_count} "
             f"skip={skip_count} "
             f"post_skip={post_skip_count} "
-            f"pending={pending_gb:.2f}"
+            f"pending={pending_gb:.2f} "
+            f"indexing_delay={last_indexing_delay:.1f}"
         )
 
     def refresh_if_due(progress):
