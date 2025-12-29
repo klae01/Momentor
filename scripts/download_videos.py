@@ -1,6 +1,5 @@
 import argparse
 import json
-import ijson
 import os
 import shutil
 import subprocess
@@ -25,6 +24,7 @@ DEFAULT_DISPATCH_INTERVAL_SECONDS = 2.0
 INDEX_REFRESH_SECONDS = 60.0
 DEFAULT_UPLOAD_REFERENCE_GB = 7.0
 TQDM_FORMAT = "{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}"
+YT_INDEX_NAME = "yt_index.json"
 
 
 @contextmanager
@@ -45,7 +45,21 @@ def load_index_file(path):
         return set(data)
     if isinstance(data, dict):
         return set(data.keys())
-    raise ValueError(f"Remote index {index_path} must be a JSON array or object.")
+    raise ValueError(f"Remote index {path} must be a JSON array or object.")
+
+
+def load_yt_index(repo_id, repo_type):
+    snapshot_path = snapshot_download(
+        repo_id=repo_id,
+        repo_type=repo_type,
+        allow_patterns=[YT_INDEX_NAME],
+    )
+    index_path = os.path.join(snapshot_path, YT_INDEX_NAME)
+    with open(index_path, "r") as handle:
+        index_data = json.load(handle)
+    if not isinstance(index_data, list):
+        raise ValueError(f"{YT_INDEX_NAME} must be a JSON array.")
+    return index_data
 
 
 def split_repo_files(repo_files):
@@ -80,7 +94,6 @@ def build_tar(tar_path, file_paths):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source_path", required=True, type=str)
     parser.add_argument("--video_path", required=True, type=str)
     parser.add_argument("--jobs", type=int, default=8)
     parser.add_argument("--hf-repo", required=True, type=str)
@@ -91,6 +104,10 @@ def main():
     parser.add_argument("--index-dir", default="index", type=str)
     args = parser.parse_args()
 
+    jobs = args.jobs if args.jobs and args.jobs > 0 else 1
+    api = HfApi()
+    api.create_repo(args.hf_repo, repo_type=args.repo_type, exist_ok=True)
+
     if shutil.which("yt-dlp") is None:
         print("yt-dlp is required to download videos. Please install it first.", file=sys.stderr)
         sys.exit(1)
@@ -100,16 +117,9 @@ def main():
     reference_bytes = int(args.upload_reference_gb * 1024 * 1024 * 1024)
     if reference_bytes > threshold_bytes:
         reference_bytes = threshold_bytes
-    jobs = args.jobs if args.jobs and args.jobs > 0 else 1
-    api = HfApi()
-    api.create_repo(args.hf_repo, repo_type=args.repo_type, exist_ok=True)
 
-    print("Loading data.")
-    with open(args.source_path, "r") as handle:
-        video_names = []
-        for prefix, event, value in ijson.parse(handle):
-            if prefix == "" and event == "map_key":
-                video_names.append(value)
+    print(f"Loading {YT_INDEX_NAME}.")
+    video_names = load_yt_index(args.hf_repo, args.repo_type)
     youtube_video_format = "https://www.youtube.com/watch?v={}"
 
     batch_entries = []
