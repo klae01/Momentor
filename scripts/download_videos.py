@@ -37,6 +37,7 @@ def hf_quiet_upload():
         if not previously_disabled:
             enable_progress_bars()
 
+
 def load_remote_index(repo_id, repo_type, index_path, revision):
     try:
         cached = hf_hub_download(
@@ -62,6 +63,7 @@ def load_remote_index(repo_id, repo_type, index_path, revision):
 
 def split_repo_files(repo_files):
     tar_numbers = []
+    index_numbers = []
     index_files = []
     for path in repo_files:
         if path.startswith("videos/part_") and path.endswith(".tar"):
@@ -71,11 +73,16 @@ def split_repo_files(repo_files):
             continue
         if path.startswith("index/") and path.endswith(".json"):
             index_files.append(path)
-    return tar_numbers, index_files
+            if path.startswith("index/part_"):
+                number_text = path[len("index/part_") : -len(".json")]
+                if number_text.isdigit():
+                    index_numbers.append(int(number_text))
+    return tar_numbers, index_numbers, index_files
 
 
-def next_part_number(tar_numbers):
-    return max(tar_numbers) + 1 if tar_numbers else 0
+def next_part_number(tar_numbers, index_numbers):
+    all_numbers = tar_numbers + index_numbers
+    return max(all_numbers) + 1 if all_numbers else 0
 
 
 def build_tar(tar_path, file_paths):
@@ -124,7 +131,8 @@ def main():
     upload_ready = True
     last_index_refresh = 0.0
     last_index_sha = None
-    uploaded_files = set()
+    last_repo_files = []
+    last_remote_files = set()
 
     def add_to_batch(path):
         nonlocal batch_size, upload_ready
@@ -143,47 +151,39 @@ def main():
             upload_ready = True
         return True
 
-    def remove_entries(names):
-        nonlocal batch_entries, batch_size
-        if not names:
-            return
-        remaining = []
-        for entry in batch_entries:
-            if entry["name"] in names:
-                batch_size -= entry["size"]
-                batch_names.discard(entry["name"])
-            else:
-                remaining.append(entry)
-        batch_entries = remaining
-
-    def prune_uploaded():
+    def remove_entries(names, count_post_skip=False):
         nonlocal batch_entries, batch_size, post_skip_count
-        if not batch_entries:
+        if not names or not batch_entries:
             return 0
         remaining = []
         removed = 0
         for entry in batch_entries:
-            if entry["name"] in uploaded_files:
+            if entry["name"] in names:
                 removed += 1
                 batch_size -= entry["size"]
                 batch_names.discard(entry["name"])
             else:
                 remaining.append(entry)
         if removed:
-            post_skip_count += removed
             batch_entries = remaining
+            if count_post_skip:
+                post_skip_count += removed
         return removed
 
     def refresh_indexes(force=False):
-        nonlocal uploaded_files, last_index_refresh, last_index_sha
+        nonlocal last_remote_files, last_index_refresh, last_index_sha, last_repo_files
         now = time.monotonic()
         if not force and now - last_index_refresh < INDEX_REFRESH_SECONDS:
             return False
-        last_index_refresh = now
-        last_index_sha = api.repo_info(args.hf_repo, repo_type=args.repo_type).sha
-        repo_files = api.list_repo_files(args.hf_repo, repo_type=args.repo_type)
-        _, index_files = split_repo_files(repo_files)
-        new_uploaded = set()
+        curr_index_sha = api.repo_info(args.hf_repo, repo_type=args.repo_type).sha
+        curr_repo_files = api.list_repo_files(
+            args.hf_repo,
+            repo_type=args.repo_type,
+            revision=curr_index_sha,
+        )
+        _, _, index_files = split_repo_files(curr_repo_files)
+
+        curr_remote_files = set()
         with hf_quiet_upload():
             for index_path in tqdm(
                 index_files,
@@ -196,12 +196,17 @@ def main():
                     args.hf_repo,
                     args.repo_type,
                     index_path,
-                    last_index_sha,
+                    curr_index_sha,
                 )
-                new_uploaded.update(index_data)
-        changed = new_uploaded != uploaded_files
-        uploaded_files = new_uploaded
-        removed = prune_uploaded()
+                curr_remote_files.update(index_data)
+
+        changed = curr_remote_files != last_remote_files
+        removed = remove_entries(curr_remote_files, count_post_skip=True)
+
+        last_index_refresh = now
+        last_index_sha = curr_index_sha
+        last_repo_files = curr_repo_files
+        last_remote_files = curr_remote_files
         return changed or removed > 0
 
     def select_entries(target_bytes, allow_smaller=False):
@@ -222,71 +227,63 @@ def main():
         return exc.response.status_code in (409, 412)
 
     def attempt_upload(final=False):
-        nonlocal upload_ready
-        refresh_indexes(force=True)
-        if last_index_sha is None:
+        nonlocal post_skip_count
+        while True:
             refresh_indexes(force=True)
-        if not batch_entries:
-            return False
-        if not final and batch_size < reference_bytes:
-            return False
-        target_bytes = reference_bytes if not final else batch_size
-        selected, _ = select_entries(target_bytes, allow_smaller=final)
-        if not selected:
-            return False
-
-        repo_files = api.list_repo_files(args.hf_repo, repo_type=args.repo_type)
-        tar_numbers, _ = split_repo_files(repo_files)
-        part_number = next_part_number(tar_numbers)
-        tar_name = f"part_{part_number:04d}.tar"
-        selected_names = [entry["name"] for entry in selected]
-        selected_sizes = {entry["name"]: entry["size"] for entry in selected}
-        index_path = os.path.join(args.index_dir, tar_name.replace(".tar", ".json"))
-
-        temp_dir = tempfile.mkdtemp(prefix="hf_upload_")
-        temp_videos = os.path.join(temp_dir, "videos")
-        temp_index_dir = os.path.join(temp_dir, "index")
-        os.makedirs(temp_videos, exist_ok=True)
-        os.makedirs(temp_index_dir, exist_ok=True)
-
-        tar_path = os.path.join(temp_videos, tar_name)
-        build_tar(tar_path, [entry["path"] for entry in selected])
-
-        existing = load_remote_index(
-            args.hf_repo,
-            args.repo_type,
-            index_path,
-            last_index_sha,
-        )
-        index_data = {name: size for name, size in selected_sizes.items() if name not in existing}
-        temp_index = os.path.join(temp_index_dir, os.path.basename(index_path))
-        with open(temp_index, "w") as handle:
-            json.dump(index_data, handle, indent=0, ensure_ascii=False)
-
-        try:
-            parent_sha = last_index_sha
-            with hf_quiet_upload():
-                api.upload_folder(
-                    folder_path=temp_dir,
-                    path_in_repo="",
-                    repo_id=args.hf_repo,
-                    repo_type=args.repo_type,
-                    parent_commit=parent_sha,
-                    commit_message=f"Upload videos/{tar_name} and {index_path}",
-                )
-        except HfHubHTTPError as exc:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            if is_conflict_error(exc):
-                refresh_indexes(force=True)
-                upload_ready = False
+            if not batch_entries:
                 return False
-            raise
+            if not final and batch_size < reference_bytes:
+                return False
 
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        print(f"Upload complete: videos/{tar_name} -> {index_path}")
-        remove_entries(set(selected_names))
-        uploaded_files.update(selected_names)
-        return True
+            tar_numbers, index_numbers, index_files = split_repo_files(last_repo_files)
+            part_number = next_part_number(tar_numbers, index_numbers)
+            tar_name = f"part_{part_number:04d}.tar"
+            index_path = os.path.join(args.index_dir, tar_name.replace(".tar", ".json"))
+            if index_path in index_files:
+                continue
+
+            target_bytes = reference_bytes if not final else batch_size
+            selected, _ = select_entries(target_bytes, allow_smaller=final)
+            if not selected:
+                return False
+            selected_names = [entry["name"] for entry in selected]
+            selected_sizes = {entry["name"]: entry["size"] for entry in selected}
+
+            temp_dir = tempfile.mkdtemp(prefix="hf_upload_")
+            temp_videos = os.path.join(temp_dir, "videos")
+            temp_index_dir = os.path.join(temp_dir, "index")
+            os.makedirs(temp_videos, exist_ok=True)
+            os.makedirs(temp_index_dir, exist_ok=True)
+
+            tar_path = os.path.join(temp_videos, tar_name)
+            build_tar(tar_path, [entry["path"] for entry in selected])
+
+            temp_index = os.path.join(temp_index_dir, os.path.basename(index_path))
+            with open(temp_index, "w") as handle:
+                json.dump(selected_sizes, handle, indent=0, ensure_ascii=False)
+
+            try:
+                parent_sha = last_index_sha
+                with hf_quiet_upload():
+                    api.upload_folder(
+                        folder_path=temp_dir,
+                        path_in_repo="",
+                        repo_id=args.hf_repo,
+                        repo_type=args.repo_type,
+                        parent_commit=parent_sha,
+                        commit_message=f"Upload videos/{tar_name} and {index_path}",
+                    )
+            except HfHubHTTPError as exc:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                if is_conflict_error(exc):
+                    continue
+                raise
+
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            print(f"Upload complete: videos/{tar_name} -> {index_path}")
+            remove_entries(set(selected_names))
+            last_remote_files.update(selected_names)
+            return True
 
     def maybe_flush():
         nonlocal upload_ready
@@ -386,7 +383,7 @@ def main():
                     name, status, result = future.result()
                     filename = f"{name}.mp4"
                     if status == "downloaded":
-                        if filename in uploaded_files:
+                        if filename in last_remote_files:
                             post_skip_count += 1
                         else:
                             success_count += 1
@@ -396,7 +393,7 @@ def main():
                     else:
                         skip_count += 1
                         if isinstance(result, str):
-                            if filename in uploaded_files:
+                            if filename in last_remote_files:
                                 post_skip_count += 1
                             else:
                                 add_to_batch(result)
@@ -412,7 +409,7 @@ def main():
                 refresh_if_due(progress)
                 filename = f"{name}.mp4"
                 file_path = os.path.join(args.video_path, filename)
-                if filename in uploaded_files:
+                if filename in last_remote_files:
                     skip_count += 1
                     progress.update(1)
                     progress.set_postfix_str(status_text(), refresh=False)
