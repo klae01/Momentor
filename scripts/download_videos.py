@@ -252,7 +252,12 @@ def main():
         tar_path = os.path.join(temp_videos, tar_name)
         build_tar(tar_path, [entry["path"] for entry in selected])
 
-        existing = load_remote_index(api, args.hf_repo, args.repo_type, index_path)
+        existing = load_remote_index(
+            args.hf_repo,
+            args.repo_type,
+            index_path,
+            last_index_sha,
+        )
         index_data = {name: size for name, size in selected_sizes.items() if name not in existing}
         temp_index = os.path.join(temp_index_dir, os.path.basename(index_path))
         with open(temp_index, "w") as handle:
