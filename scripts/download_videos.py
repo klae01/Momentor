@@ -314,7 +314,7 @@ def main():
         nonlocal next_dispatch_time
         if dispatch_interval <= 0:
             return
-        while time.monotonic() >= next_dispatch_time:
+        while time.monotonic() <= next_dispatch_time:
             for f in callbacks:
                 f()
             time.sleep(0.2)
