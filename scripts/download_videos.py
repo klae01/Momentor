@@ -9,12 +9,15 @@ import tempfile
 import time
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
+import random
 
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError, HfHubHTTPError
 from tqdm import tqdm
 
-DISPATCH_INTERVAL_SECONDS = 2.0
+DEFAULT_DISPATCH_INTERVAL_SECONDS = 2.0
+INDEX_REFRESH_SECONDS = 60.0
+DEFAULT_UPLOAD_REFERENCE_GB = 7.0
 TQDM_FORMAT = "{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}"
 
 
@@ -41,19 +44,15 @@ def hf_quiet_upload():
 def load_remote_index(repo_id, repo_type, index_path):
     try:
         cached = hf_hub_download(repo_id, index_path, repo_type=repo_type)
-    except EntryNotFoundError:
-        return []
-    except HfHubHTTPError as exc:
-        if exc.response is not None and exc.response.status_code == 404:
-            return []
-        raise
+    except (EntryNotFoundError, HfHubHTTPError):
+        return set()
     with open(cached, "r") as handle:
         data = json.load(handle)
+    if isinstance(data, list):
+        return set(data)
     if isinstance(data, dict):
-        data = list(data.keys())
-    if not isinstance(data, list):
-        raise ValueError(f"Remote index {index_path} is not a JSON array.")
-    return data
+        return set(data.keys())
+    raise ValueError(f"Remote index {index_path} must be a JSON array or object.")
 
 
 def split_repo_files(repo_files):
@@ -74,40 +73,6 @@ def next_part_number(tar_numbers):
     return max(tar_numbers) + 1 if tar_numbers else 0
 
 
-def upload_tar_and_index(api, repo_id, repo_type, index_dir, tar_path, file_names):
-    part_name = os.path.basename(tar_path)
-    index_path = os.path.join(index_dir, part_name.replace(".tar", ".json"))
-    index_data = load_remote_index(repo_id, repo_type, index_path)
-
-    with hf_quiet_upload():
-        api.upload_file(
-            path_or_fileobj=tar_path,
-            path_in_repo=f"videos/{part_name}",
-            repo_id=repo_id,
-            repo_type=repo_type,
-        )
-    if not index_data:
-        index_data = []
-    existing = set(index_data)
-    for name in file_names:
-        if name not in existing:
-            index_data.append(name)
-            existing.add(name)
-
-    with tempfile.NamedTemporaryFile("w", delete=False) as handle:
-        json.dump(index_data, handle)
-        temp_index = handle.name
-    with hf_quiet_upload():
-        api.upload_file(
-            path_or_fileobj=temp_index,
-            path_in_repo=index_path,
-            repo_id=repo_id,
-            repo_type=repo_type,
-        )
-    os.remove(temp_index)
-    print(f"Upload complete: videos/{part_name} -> {index_path}")
-
-
 def build_tar(tar_path, file_paths):
     with tarfile.open(tar_path, "w") as tar:
         for path in file_paths:
@@ -122,6 +87,8 @@ def main():
     parser.add_argument("--hf-repo", required=True, type=str)
     parser.add_argument("--repo-type", default="dataset", type=str)
     parser.add_argument("--upload-threshold-gb", type=float, default=8.0)
+    parser.add_argument("--upload-reference-gb", type=float, default=DEFAULT_UPLOAD_REFERENCE_GB)
+    parser.add_argument("--dispatch-interval", type=float, default=DEFAULT_DISPATCH_INTERVAL_SECONDS)
     parser.add_argument("--index-dir", default="index", type=str)
     args = parser.parse_args()
 
@@ -131,6 +98,9 @@ def main():
 
     os.makedirs(args.video_path, exist_ok=True)
     threshold_bytes = int(args.upload_threshold_gb * 1024 * 1024 * 1024)
+    reference_bytes = int(args.upload_reference_gb * 1024 * 1024 * 1024)
+    if reference_bytes > threshold_bytes:
+        reference_bytes = threshold_bytes
     jobs = args.jobs if args.jobs and args.jobs > 0 else 1
     api = HfApi()
     api.create_repo(args.hf_repo, repo_type=args.repo_type, exist_ok=True)
@@ -143,7 +113,7 @@ def main():
     youtube_video_format = "https://www.youtube.com/watch?v={}"
 
     repo_files = api.list_repo_files(args.hf_repo, repo_type=args.repo_type)
-    tar_numbers, index_files = split_repo_files(repo_files)
+    _, index_files = split_repo_files(repo_files)
     uploaded_files = set()
     if index_files:
         for index_path in tqdm(
@@ -156,48 +126,164 @@ def main():
             index_data = load_remote_index(args.hf_repo, args.repo_type, index_path)
             uploaded_files.update(index_data)
 
-    batch_paths = []
-    batch_names = []
+    batch_entries = []
+    batch_names = set()
     batch_size = 0
+    post_skip_count = 0
+    upload_ready = True
+    last_index_refresh = time.monotonic()
 
-    def flush_batch():
-        nonlocal batch_paths, batch_names, batch_size
-        if not batch_paths:
+    def add_to_batch(path):
+        nonlocal batch_size, upload_ready
+        if not os.path.exists(path):
+            return False
+        name = os.path.basename(path)
+        if name in batch_names:
+            return False
+        size = os.path.getsize(path)
+        if size <= 0:
+            return False
+        batch_entries.append({"name": name, "path": path, "size": size})
+        batch_names.add(name)
+        batch_size += size
+        if not upload_ready:
+            upload_ready = True
+        return True
+
+    def remove_entries(names):
+        nonlocal batch_entries, batch_size
+        if not names:
             return
+        remaining = []
+        for entry in batch_entries:
+            if entry["name"] in names:
+                batch_size -= entry["size"]
+                batch_names.discard(entry["name"])
+            else:
+                remaining.append(entry)
+        batch_entries = remaining
+
+    def prune_uploaded():
+        nonlocal batch_entries, batch_size, post_skip_count
+        if not batch_entries:
+            return 0
+        remaining = []
+        removed = 0
+        for entry in batch_entries:
+            if entry["name"] in uploaded_files:
+                removed += 1
+                batch_size -= entry["size"]
+                batch_names.discard(entry["name"])
+            else:
+                remaining.append(entry)
+        if removed:
+            post_skip_count += removed
+            batch_entries = remaining
+        return removed
+
+    def refresh_indexes(force=False):
+        nonlocal uploaded_files, last_index_refresh
+        now = time.monotonic()
+        if not force and now - last_index_refresh < INDEX_REFRESH_SECONDS:
+            return False
+        last_index_refresh = now
+        repo_files = api.list_repo_files(args.hf_repo, repo_type=args.repo_type)
+        _, index_files = split_repo_files(repo_files)
+        new_uploaded = set()
+        for index_path in index_files:
+            index_data = load_remote_index(args.hf_repo, args.repo_type, index_path)
+            new_uploaded.update(index_data)
+        changed = new_uploaded != uploaded_files
+        uploaded_files = new_uploaded
+        removed = prune_uploaded()
+        return changed or removed > 0
+
+    def select_entries(target_bytes, allow_smaller=False):
+        selected = []
+        total = 0
+        for entry in batch_entries:
+            if total >= target_bytes:
+                break
+            selected.append(entry)
+            total += entry["size"]
+        if not allow_smaller and total < target_bytes:
+            return [], 0
+        return selected, total
+
+    def is_conflict_error(exc):
+        if getattr(exc, "response", None) is None:
+            return False
+        return exc.response.status_code in (409, 412)
+
+    def attempt_upload(final=False):
+        nonlocal upload_ready
+        refresh_indexes(force=True)
+        if not batch_entries:
+            return False
+        if not final and batch_size < reference_bytes:
+            return False
+        target_bytes = reference_bytes if not final else batch_size
+        selected, _ = select_entries(target_bytes, allow_smaller=final)
+        if not selected:
+            return False
+
         repo_files = api.list_repo_files(args.hf_repo, repo_type=args.repo_type)
         tar_numbers, _ = split_repo_files(repo_files)
         part_number = next_part_number(tar_numbers)
         tar_name = f"part_{part_number:04d}.tar"
-        tar_path = os.path.join(args.video_path, tar_name)
-        build_tar(tar_path, batch_paths)
-        upload_tar_and_index(
-            api,
-            args.hf_repo,
-            args.repo_type,
-            args.index_dir,
-            tar_path,
-            batch_names,
-        )
-        os.remove(tar_path)
-        uploaded_files.update(batch_names)
-        batch_paths = []
-        batch_names = []
-        batch_size = 0
+        selected_names = [entry["name"] for entry in selected]
+        selected_sizes = {entry["name"]: entry["size"] for entry in selected}
+        index_path = os.path.join(args.index_dir, tar_name.replace(".tar", ".json"))
 
-    def add_to_batch(path):
-        nonlocal batch_size
-        if not os.path.exists(path):
-            return
-        size = os.path.getsize(path)
-        if size <= 0:
-            return
-        batch_paths.append(path)
-        batch_names.append(os.path.basename(path))
-        batch_size += size
+        temp_dir = tempfile.mkdtemp(prefix="hf_upload_")
+        temp_videos = os.path.join(temp_dir, "videos")
+        temp_index_dir = os.path.join(temp_dir, "index")
+        os.makedirs(temp_videos, exist_ok=True)
+        os.makedirs(temp_index_dir, exist_ok=True)
+
+        tar_path = os.path.join(temp_videos, tar_name)
+        build_tar(tar_path, [entry["path"] for entry in selected])
+
+        existing = load_remote_index(args.hf_repo, args.repo_type, index_path)
+        index_data = {name: selected_sizes[name] for name in selected_names if name not in existing}
+        temp_index = os.path.join(temp_index_dir, os.path.basename(index_path))
+        with open(temp_index, "w") as handle:
+            json.dump(index_data, handle, indent=0, ensure_ascii=False)
+
+        try:
+            parent_sha = api.repo_info(args.hf_repo, repo_type=args.repo_type).sha
+            with hf_quiet_upload():
+                api.upload_folder(
+                    folder_path=temp_dir,
+                    path_in_repo="",
+                    repo_id=args.hf_repo,
+                    repo_type=args.repo_type,
+                    parent_commit=parent_sha,
+                    commit_message=f"Upload videos/{tar_name} and {index_path}",
+                )
+        except HfHubHTTPError as exc:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            if is_conflict_error(exc):
+                refresh_indexes(force=True)
+                upload_ready = False
+                return False
+            raise
+
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        print(f"Upload complete: videos/{tar_name} -> {index_path}")
+        remove_entries(set(selected_names))
+        uploaded_files.update(selected_names)
+        return True
 
     def maybe_flush():
-        if batch_size >= threshold_bytes:
-            flush_batch()
+        nonlocal upload_ready
+        if batch_size < threshold_bytes:
+            upload_ready = True
+            return
+        if not upload_ready:
+            return
+        if not attempt_upload(final=False):
+            upload_ready = False
 
     def download_one(video_name):
         url = youtube_video_format.format(video_name)
@@ -229,27 +315,42 @@ def main():
     success_count = 0
     fail_count = 0
     skip_count = 0
-    next_dispatch_time = time.monotonic() + DISPATCH_INTERVAL_SECONDS
+    dispatch_interval = max(0.0, args.dispatch_interval)
+    next_dispatch_time = time.monotonic() + dispatch_interval
 
     def status_text():
         pending_gb = batch_size / (1024 * 1024 * 1024)
-        return f"success={success_count} fail={fail_count} skip={skip_count} pending={pending_gb:.2f}"
+        return (
+            f"success={success_count} "
+            f"fail={fail_count} "
+            f"skip={skip_count} "
+            f"post_skip={post_skip_count} "
+            f"pending={pending_gb:.2f}"
+        )
 
-    def wait_for_dispatch(collect_fn=None):
+    def refresh_if_due(progress):
+        if refresh_indexes(force=False):
+            progress.set_postfix_str(status_text(), refresh=False)
+
+    def wait_for_dispatch(collect_fn=None, refresh_fn=None):
         nonlocal next_dispatch_time
+        if dispatch_interval <= 0:
+            return
         while True:
             now = time.monotonic()
             if now >= next_dispatch_time:
                 break
             if collect_fn is not None:
                 collect_fn()
+            if refresh_fn is not None:
+                refresh_fn()
             time.sleep(0.2)
         next_dispatch_time = max(
-            next_dispatch_time + DISPATCH_INTERVAL_SECONDS,
-            time.monotonic() + DISPATCH_INTERVAL_SECONDS,
+            next_dispatch_time + dispatch_interval,
+            time.monotonic() + dispatch_interval,
         )
 
-    to_download = []
+    random.shuffle(video_names)
     with tqdm(
         total=len(video_names),
         ncols=120,
@@ -257,67 +358,83 @@ def main():
         mininterval=10,
         bar_format=TQDM_FORMAT,
     ) as progress:
-        for name in video_names:
-            filename = f"{name}.mp4"
-            file_path = os.path.join(args.video_path, filename)
-            if filename in uploaded_files:
-                skip_count += 1
-                progress.update(1)
-                progress.set_postfix_str(status_text(), refresh=False)
-                continue
-            if os.path.exists(file_path):
-                skip_count += 1
-                add_to_batch(file_path)
-                maybe_flush()
-                progress.update(1)
-                progress.set_postfix_str(status_text(), refresh=False)
-                continue
-            to_download.append(name)
-
         with ThreadPoolExecutor(max_workers=jobs) as executor:
             pending = []
             max_pending = max(1, jobs * 2)
 
             def collect_completed():
-                nonlocal success_count, fail_count, skip_count
+                nonlocal success_count, fail_count, skip_count, post_skip_count
                 completed = []
                 for future in pending:
                     if not future.done():
                         continue
                     completed.append(future)
-                    _, status, result = future.result()
+                    name, status, result = future.result()
+                    filename = f"{name}.mp4"
                     if status == "downloaded":
-                        success_count += 1
-                        add_to_batch(result)
+                        if filename in uploaded_files:
+                            post_skip_count += 1
+                        else:
+                            success_count += 1
+                            add_to_batch(result)
                     elif status == "failed":
                         fail_count += 1
                     else:
                         skip_count += 1
                         if isinstance(result, str):
-                            add_to_batch(result)
+                            if filename in uploaded_files:
+                                post_skip_count += 1
+                            else:
+                                add_to_batch(result)
                     progress.update(1)
+                    progress.set_postfix_str(status_text(), refresh=False)
                 for future in completed:
                     pending.remove(future)
                 if completed:
                     maybe_flush()
                     progress.set_postfix_str(status_text(), refresh=False)
 
-            for name in to_download:
+            for name in video_names:
+                refresh_if_due(progress)
+                filename = f"{name}.mp4"
+                file_path = os.path.join(args.video_path, filename)
+                if filename in uploaded_files:
+                    skip_count += 1
+                    progress.update(1)
+                    progress.set_postfix_str(status_text(), refresh=False)
+                    continue
+                if os.path.exists(file_path):
+                    skip_count += 1
+                    add_to_batch(file_path)
+                    maybe_flush()
+                    progress.update(1)
+                    progress.set_postfix_str(status_text(), refresh=False)
+                    continue
+
                 while len(pending) >= max_pending:
                     collect_completed()
+                    refresh_if_due(progress)
                     if len(pending) >= max_pending:
                         time.sleep(0.2)
+
                 pending.append(executor.submit(download_one, name))
-                wait_for_dispatch(collect_completed)
+                wait_for_dispatch(collect_completed, lambda: refresh_if_due(progress))
                 collect_completed()
 
             while pending:
                 collect_completed()
+                refresh_if_due(progress)
                 if pending:
                     time.sleep(0.5)
 
-    if batch_paths:
-        flush_batch()
+            while batch_entries:
+                if attempt_upload(final=True):
+                    progress.set_postfix_str(status_text(), refresh=False)
+                    continue
+                refresh_if_due(progress)
+                if not batch_entries:
+                    break
+                time.sleep(0.5)
 
     print(f"Finished. Success: {success_count}. Failed: {fail_count}. Skipped: {skip_count}.")
 
