@@ -28,7 +28,7 @@ TQDM_FORMAT = "{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remain
 
 
 @contextmanager
-def hf_quiet_upload():
+def hf_quiet():
     previously_disabled = are_progress_bars_disabled()
     disable_progress_bars()
     try:
@@ -181,7 +181,7 @@ def main():
         _, _, index_files = split_repo_files(curr_repo_files)
 
         curr_remote_files = set()
-        with hf_quiet_upload():
+        with hf_quiet():
             for index_path in tqdm(
                 index_files,
                 ncols=120,
@@ -206,7 +206,7 @@ def main():
         last_remote_files = curr_remote_files
         return changed or removed > 0
 
-    def select_entries(target_bytes, size_lowerbound=0):
+    def select_entries(target_bytes):
         selected = []
         total = 0
         for entry in batch_entries:
@@ -214,8 +214,6 @@ def main():
                 break
             selected.append(entry)
             total += entry["size"]
-        if total < size_lowerbound:
-            return [], 0
         return selected, total
 
     def is_conflict_error(exc):
@@ -227,18 +225,14 @@ def main():
         nonlocal post_skip_count
         while True:
             refresh_indexes(force=True)
-            if not batch_entries:
+            if not batch_entries or (not final and batch_size < reference_bytes):
                 return False
-            tar_numbers, index_numbers, index_files = split_repo_files(last_repo_files)
+            tar_numbers, index_numbers, _ = split_repo_files(last_repo_files)
             part_number = next_part_number(tar_numbers, index_numbers)
             tar_name = f"part_{part_number:04d}.tar"
             index_path = os.path.join(args.index_dir, tar_name.replace(".tar", ".json"))
-            if index_path in index_files:
-                continue
-
-            size_lowerbound=(0 if final else reference_bytes)
-            selected, _ = select_entries(threshold_bytes, size_lowerbound)
-            if not selected:
+            selected, total_bytes = select_entries(threshold_bytes)
+            if total_bytes < (0 if final else reference_bytes):
                 return False
             selected_names = [entry["name"] for entry in selected]
             selected_sizes = {entry["name"]: entry["size"] for entry in selected}
@@ -258,7 +252,7 @@ def main():
 
             try:
                 parent_sha = last_index_sha
-                with hf_quiet_upload():
+                with hf_quiet():
                     api.upload_folder(
                         folder_path=temp_dir,
                         path_in_repo="",
@@ -268,12 +262,12 @@ def main():
                         commit_message=f"Upload videos/{tar_name} and {index_path}",
                     )
             except HfHubHTTPError as exc:
-                shutil.rmtree(temp_dir, ignore_errors=True)
                 if is_conflict_error(exc):
                     continue
                 raise
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
-            shutil.rmtree(temp_dir, ignore_errors=True)
             print(f"Upload complete: videos/{tar_name} -> {index_path}")
             remove_entries(set(selected_names))
             last_remote_files.update(selected_names)
@@ -330,18 +324,13 @@ def main():
         if refresh_indexes(force=False):
             progress.set_postfix_str(status_text(), refresh=False)
 
-    def wait_for_dispatch(collect_fn=None, refresh_fn=None):
+    def wait_for_dispatch(*callbacks):
         nonlocal next_dispatch_time
         if dispatch_interval <= 0:
             return
-        while True:
-            now = time.monotonic()
-            if now >= next_dispatch_time:
-                break
-            if collect_fn is not None:
-                collect_fn()
-            if refresh_fn is not None:
-                refresh_fn()
+        while time.monotonic() >= next_dispatch_time:
+            for f in callbacks:
+                f()
             time.sleep(0.2)
         next_dispatch_time = max(
             next_dispatch_time + dispatch_interval,
@@ -385,12 +374,11 @@ def main():
                                 post_skip_count += 1
                             else:
                                 add_to_batch(result)
-                    progress.update(1)
-                    progress.set_postfix_str(status_text(), refresh=False)
                 for future in completed:
                     pending.remove(future)
                 if completed:
                     maybe_flush()
+                    progress.update(n=len(completed))
                     progress.set_postfix_str(status_text(), refresh=False)
 
             for name in video_names:
@@ -418,7 +406,6 @@ def main():
 
                 pending.append(executor.submit(download_one, name))
                 wait_for_dispatch(collect_completed, lambda: refresh_if_due(progress))
-                collect_completed()
 
             while pending:
                 collect_completed()
