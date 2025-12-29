@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "huggingface_hub>=0.24.0",
+    "ijson>=3.4.0.post0",
     "numpy==1.24.3",
     "tqdm==4.65.0",
     "yt-dlp>=2025.12.8",

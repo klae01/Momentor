@@ -1,5 +1,6 @@
 import argparse
 import json
+import ijson
 import os
 import shutil
 import subprocess
@@ -105,9 +106,10 @@ def main():
 
     print("Loading data.")
     with open(args.source_path, "r") as handle:
-        packed_data = json.load(handle)
-
-    video_names = list(packed_data.keys())
+        video_names = []
+        for prefix, event, value in ijson.parse(handle):
+            if prefix == "" and event == "map_key":
+                video_names.append(value)
     youtube_video_format = "https://www.youtube.com/watch?v={}"
 
     batch_entries = []
