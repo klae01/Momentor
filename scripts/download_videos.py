@@ -12,7 +12,13 @@ from concurrent.futures import ThreadPoolExecutor
 import random
 
 from huggingface_hub import HfApi, hf_hub_download
-from huggingface_hub.utils import EntryNotFoundError, HfHubHTTPError
+from huggingface_hub.utils import (
+    EntryNotFoundError,
+    HfHubHTTPError,
+    are_progress_bars_disabled,
+    disable_progress_bars,
+    enable_progress_bars,
+)
 from tqdm import tqdm
 
 DEFAULT_DISPATCH_INTERVAL_SECONDS = 2.0
@@ -23,29 +29,28 @@ TQDM_FORMAT = "{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remain
 
 @contextmanager
 def hf_quiet_upload():
-    previous_env = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
-    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-    try:
-        from huggingface_hub.utils import logging as hf_logging
-    except Exception:
-        hf_logging = None
-    if hf_logging is not None and hasattr(hf_logging, "disable_progress_bars"):
-        hf_logging.disable_progress_bars()
+    previously_disabled = are_progress_bars_disabled()
+    disable_progress_bars()
     try:
         yield
     finally:
-        if hf_logging is not None and hasattr(hf_logging, "enable_progress_bars"):
-            hf_logging.enable_progress_bars()
-        if previous_env is None:
-            os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
-        else:
-            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = previous_env
+        if not previously_disabled:
+            enable_progress_bars()
 
-def load_remote_index(repo_id, repo_type, index_path):
+def load_remote_index(repo_id, repo_type, index_path, revision):
     try:
-        cached = hf_hub_download(repo_id, index_path, repo_type=repo_type)
-    except (EntryNotFoundError, HfHubHTTPError):
+        cached = hf_hub_download(
+            repo_id,
+            index_path,
+            repo_type=repo_type,
+            revision=revision,
+        )
+    except EntryNotFoundError:
         return set()
+    except HfHubHTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            return set()
+        raise
     with open(cached, "r") as handle:
         data = json.load(handle)
     if isinstance(data, list):
@@ -112,26 +117,14 @@ def main():
     video_names = list(packed_data.keys())
     youtube_video_format = "https://www.youtube.com/watch?v={}"
 
-    repo_files = api.list_repo_files(args.hf_repo, repo_type=args.repo_type)
-    _, index_files = split_repo_files(repo_files)
-    uploaded_files = set()
-    if index_files:
-        for index_path in tqdm(
-            index_files,
-            ncols=120,
-            desc="Loading indexes",
-            mininterval=10,
-            bar_format=TQDM_FORMAT,
-        ):
-            index_data = load_remote_index(args.hf_repo, args.repo_type, index_path)
-            uploaded_files.update(index_data)
-
     batch_entries = []
     batch_names = set()
     batch_size = 0
     post_skip_count = 0
     upload_ready = True
-    last_index_refresh = time.monotonic()
+    last_index_refresh = 0.0
+    last_index_sha = None
+    uploaded_files = set()
 
     def add_to_batch(path):
         nonlocal batch_size, upload_ready
@@ -182,17 +175,30 @@ def main():
         return removed
 
     def refresh_indexes(force=False):
-        nonlocal uploaded_files, last_index_refresh
+        nonlocal uploaded_files, last_index_refresh, last_index_sha
         now = time.monotonic()
         if not force and now - last_index_refresh < INDEX_REFRESH_SECONDS:
             return False
         last_index_refresh = now
+        last_index_sha = api.repo_info(args.hf_repo, repo_type=args.repo_type).sha
         repo_files = api.list_repo_files(args.hf_repo, repo_type=args.repo_type)
         _, index_files = split_repo_files(repo_files)
         new_uploaded = set()
-        for index_path in index_files:
-            index_data = load_remote_index(args.hf_repo, args.repo_type, index_path)
-            new_uploaded.update(index_data)
+        with hf_quiet_upload():
+            for index_path in tqdm(
+                index_files,
+                ncols=120,
+                desc="Loading indexes",
+                mininterval=10,
+                bar_format=TQDM_FORMAT,
+            ):
+                index_data = load_remote_index(
+                    args.hf_repo,
+                    args.repo_type,
+                    index_path,
+                    last_index_sha,
+                )
+                new_uploaded.update(index_data)
         changed = new_uploaded != uploaded_files
         uploaded_files = new_uploaded
         removed = prune_uploaded()
@@ -218,6 +224,8 @@ def main():
     def attempt_upload(final=False):
         nonlocal upload_ready
         refresh_indexes(force=True)
+        if last_index_sha is None:
+            refresh_indexes(force=True)
         if not batch_entries:
             return False
         if not final and batch_size < reference_bytes:
@@ -244,14 +252,14 @@ def main():
         tar_path = os.path.join(temp_videos, tar_name)
         build_tar(tar_path, [entry["path"] for entry in selected])
 
-        existing = load_remote_index(args.hf_repo, args.repo_type, index_path)
-        index_data = {name: selected_sizes[name] for name in selected_names if name not in existing}
+        existing = load_remote_index(api, args.hf_repo, args.repo_type, index_path)
+        index_data = {name: size for name, size in selected_sizes.items() if name not in existing}
         temp_index = os.path.join(temp_index_dir, os.path.basename(index_path))
         with open(temp_index, "w") as handle:
             json.dump(index_data, handle, indent=0, ensure_ascii=False)
 
         try:
-            parent_sha = api.repo_info(args.hf_repo, repo_type=args.repo_type).sha
+            parent_sha = last_index_sha
             with hf_quiet_upload():
                 api.upload_folder(
                     folder_path=temp_dir,
@@ -350,6 +358,7 @@ def main():
             time.monotonic() + dispatch_interval,
         )
 
+    refresh_indexes(force=True)
     random.shuffle(video_names)
     with tqdm(
         total=len(video_names),
