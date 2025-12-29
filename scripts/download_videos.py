@@ -128,14 +128,13 @@ def main():
     batch_names = set()
     batch_size = 0
     post_skip_count = 0
-    upload_ready = True
     last_index_refresh = 0.0
     last_index_sha = None
     last_repo_files = []
     last_remote_files = set()
 
     def add_to_batch(path):
-        nonlocal batch_size, upload_ready
+        nonlocal batch_size
         if not os.path.exists(path):
             return False
         name = os.path.basename(path)
@@ -147,8 +146,6 @@ def main():
         batch_entries.append({"name": name, "path": path, "size": size})
         batch_names.add(name)
         batch_size += size
-        if not upload_ready:
-            upload_ready = True
         return True
 
     def remove_entries(names, count_post_skip=False):
@@ -209,7 +206,7 @@ def main():
         last_remote_files = curr_remote_files
         return changed or removed > 0
 
-    def select_entries(target_bytes, allow_smaller=False):
+    def select_entries(target_bytes, size_lowerbound=0):
         selected = []
         total = 0
         for entry in batch_entries:
@@ -217,7 +214,7 @@ def main():
                 break
             selected.append(entry)
             total += entry["size"]
-        if not allow_smaller and total < target_bytes:
+        if total < size_lowerbound:
             return [], 0
         return selected, total
 
@@ -232,9 +229,6 @@ def main():
             refresh_indexes(force=True)
             if not batch_entries:
                 return False
-            if not final and batch_size < reference_bytes:
-                return False
-
             tar_numbers, index_numbers, index_files = split_repo_files(last_repo_files)
             part_number = next_part_number(tar_numbers, index_numbers)
             tar_name = f"part_{part_number:04d}.tar"
@@ -242,8 +236,8 @@ def main():
             if index_path in index_files:
                 continue
 
-            target_bytes = reference_bytes if not final else batch_size
-            selected, _ = select_entries(target_bytes, allow_smaller=final)
+            size_lowerbound=(0 if final else reference_bytes)
+            selected, _ = select_entries(threshold_bytes, size_lowerbound)
             if not selected:
                 return False
             selected_names = [entry["name"] for entry in selected]
@@ -286,14 +280,8 @@ def main():
             return True
 
     def maybe_flush():
-        nonlocal upload_ready
-        if batch_size < threshold_bytes:
-            upload_ready = True
-            return
-        if not upload_ready:
-            return
-        if not attempt_upload(final=False):
-            upload_ready = False
+        if batch_size >= threshold_bytes:
+            attempt_upload(final=False)
 
     def download_one(video_name):
         url = youtube_video_format.format(video_name)
